@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Umigle KE</title>
+<style>
+body{margin:0;font-family:sans-serif;background:#000;color:#fff;display:flex;flex-direction:column;height:100vh}
+#videos{display:flex;flex:1;gap:5px;padding:5px}
+video{flex:1;background:#111;border-radius:10px;object-fit:cover}
+#controls{padding:10px;display:flex;gap:10px}
+button{flex:1;padding:15px;border:0;border-radius:10px;font-weight:bold;background:#00ff88;color:#000}
+#chat{height:120px;overflow:auto;background:#111;padding:10px}
+input{flex:2;padding:12px;border-radius:10px;border:0}
+</style>
+</head>
+<body>
+<div id="videos">
+  <video id="local" autoplay muted playsinline></video>
+  <video id="remote" autoplay playsinline></video>
+</div>
+<div id="chat"></div>
+<div id="controls">
+  <input id="msg" placeholder="Type message...">
+  <button onclick="sendChat()">Send</button>
+  <button onclick="next()" style="background:#ff0044;color:#fff">NEXT</button>
+</div>
+<button id="start" onclick="start()" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);padding:25px 50px;font-size:20px">START</button>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+let socket = io();
+let pc, localStream;
+const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+async function start(){
+  document.getElementById('start').style.display='none';
+  localStream = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+  document.getElementById('local').srcObject = localStream;
+  socket.emit('find-partner');
+}
+
+socket.on('matched', async d => {
+  pc = new RTCPeerConnection(config);
+  localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+  pc.onicecandidate = e => { if(e.candidate) socket.emit('ice-candidate',{to:pc.partner,candidate:e.candidate}) };
+  pc.ontrack = e => document.getElementById('remote').srcObject = e.streams[0];
+  
+  pc.partner = d.initiator ? null : null; // handled via server
+  if(d.initiator){
+    let offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit('offer',{to: socket.partner, offer});
+  }
+});
+
+socket.on('offer', async data => {
+  await pc.setRemoteDescription(data.offer);
+  let answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  socket.emit('answer',{to:data.from, answer});
+});
+
+socket.on('answer', d => pc.setRemoteDescription(d.answer));
+socket.on('ice-candidate', d => pc.addIceCandidate(d.candidate));
+
+function next(){ 
+  if(pc) pc.close();
+  document.getElementById('remote').srcObject=null;
+  socket.emit('next');
+}
+
+function sendChat(){
+  let m=document.getElementById('msg').value;
+  if(!m) return;
+  socket.emit('chat',{text:m});
+  addChat("You: "+m);
+  document.getElementById('msg').value='';
+}
+socket.on('chat', d=> addChat("Stranger: "+d.text));
+function addChat(t){ let c=document.getElementById('chat'); c.innerHTML+=`<div>${t}</div>`; c.scrollTop=c.scrollHeight; }
+
+socket.on('partner-left', ()=>{ addChat("Stranger disconnected. Finding new..."); document.getElementById('remote').srcObject=null; });
+socket.on('waiting', ()=> addChat("Waiting for stranger..."));
+</script>
+</body>
+</html>
