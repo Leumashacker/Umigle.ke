@@ -1,86 +1,157 @@
 <!DOCTYPE html>
 <html>
 <head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Umigle KE</title>
 <style>
 body{margin:0;font-family:sans-serif;background:#000;color:#fff;display:flex;flex-direction:column;height:100vh}
-#videos{display:flex;flex:1;gap:5px;padding:5px}
-video{flex:1;background:#111;border-radius:10px;object-fit:cover}
+#videos{display:flex;flex:1;gap:5px;padding:5px;min-height:0}
+video{flex:1;min-width:0;background:#111;border-radius:10px;object-fit:cover}
 #controls{padding:10px;display:flex;gap:10px}
 button{flex:1;padding:15px;border:0;border-radius:10px;font-weight:bold;background:#00ff88;color:#000}
 #chat{height:120px;overflow:auto;background:#111;padding:10px}
-input{flex:2;padding:12px;border-radius:10px;border:0}
+input[type=text]{flex:2;padding:12px;border-radius:10px;border:0;min-width:0}
+#gate{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;width:min(90vw,360px)}
+#gate label{display:block;margin:0 0 15px;font-size:14px}
+#start{padding:20px 50px;font-size:20px;width:100%}
+#start:disabled{opacity:.4}
+#online{position:absolute;top:10px;left:50%;transform:translateX(-50%);font-size:12px;background:#000a;padding:3px 10px;border-radius:10px}
 </style>
 </head>
 <body>
+<div id="online"></div>
 <div id="videos">
   <video id="local" autoplay muted playsinline></video>
   <video id="remote" autoplay playsinline></video>
 </div>
 <div id="chat"></div>
 <div id="controls">
-  <input id="msg" placeholder="Type message...">
+  <input type="text" id="msg" placeholder="Type message..." maxlength="500">
   <button onclick="sendChat()">Send</button>
   <button onclick="next()" style="background:#ff0044;color:#fff">NEXT</button>
+  <button onclick="report()" style="background:#444;color:#fff;flex:.6">Report</button>
 </div>
-<button id="start" onclick="start()" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);padding:25px 50px;font-size:20px">START</button>
+<div id="gate">
+  <label><input type="checkbox" id="age" onchange="document.getElementById('start').disabled=!this.checked"> I am 18 or older and will follow the rules (no nudity, harassment or illegal content).</label>
+  <button id="start" onclick="start()" disabled>START</button>
+</div>
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
-let socket = io();
-let pc, localStream;
-const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const socket = io();
+let pc = null, localStream = null, partnerId = null, iceConfig = null;
+let pendingIce = [];
+
+function addChat(t){
+  const c = document.getElementById('chat');
+  const d = document.createElement('div');
+  d.textContent = t; // textContent: no HTML injection
+  c.appendChild(d);
+  c.scrollTop = c.scrollHeight;
+}
+
+function closePeer(){
+  if(pc){ pc.onicecandidate = null; pc.ontrack = null; pc.close(); pc = null; }
+  pendingIce = [];
+  partnerId = null;
+  document.getElementById('remote').srcObject = null;
+}
 
 async function start(){
-  document.getElementById('start').style.display='none';
-  localStream = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+  document.getElementById('gate').style.display = 'none';
+  try {
+    iceConfig = await (await fetch('/ice-config')).json();
+  } catch(e) {
+    iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  }
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({video:true,audio:true});
+  } catch(e) {
+    addChat('Camera/mic permission is required.');
+    document.getElementById('gate').style.display = '';
+    return;
+  }
   document.getElementById('local').srcObject = localStream;
   socket.emit('find-partner');
 }
 
+function createPeer(){
+  pc = new RTCPeerConnection(iceConfig);
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+  pc.onicecandidate = e => {
+    if(e.candidate && partnerId) socket.emit('ice-candidate', { to: partnerId, candidate: e.candidate });
+  };
+  pc.ontrack = e => { document.getElementById('remote').srcObject = e.streams[0]; };
+  return pc;
+}
+
+async function flushIce(){
+  for(const c of pendingIce){ try { await pc.addIceCandidate(c); } catch(e){} }
+  pendingIce = [];
+}
+
 socket.on('matched', async d => {
-  pc = new RTCPeerConnection(config);
-  localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
-  pc.onicecandidate = e => { if(e.candidate) socket.emit('ice-candidate',{to:pc.partner,candidate:e.candidate}) };
-  pc.ontrack = e => document.getElementById('remote').srcObject = e.streams[0];
-  
-  pc.partner = d.initiator ? null : null; // handled via server
+  closePeer();
+  partnerId = d.partner;
+  addChat('Stranger connected. Say hi!');
+  createPeer();
   if(d.initiator){
-    let offer = await pc.createOffer();
+    const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    socket.emit('offer',{to: socket.partner, offer});
+    socket.emit('offer', { to: partnerId, offer });
   }
 });
 
 socket.on('offer', async data => {
+  if(!pc || data.from !== partnerId) return;
   await pc.setRemoteDescription(data.offer);
-  let answer = await pc.createAnswer();
+  await flushIce();
+  const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
-  socket.emit('answer',{to:data.from, answer});
+  socket.emit('answer', { to: data.from, answer });
 });
 
-socket.on('answer', d => pc.setRemoteDescription(d.answer));
-socket.on('ice-candidate', d => pc.addIceCandidate(d.candidate));
+socket.on('answer', async d => {
+  if(!pc || d.from !== partnerId) return;
+  await pc.setRemoteDescription(d.answer);
+  await flushIce();
+});
 
-function next(){ 
-  if(pc) pc.close();
-  document.getElementById('remote').srcObject=null;
+socket.on('ice-candidate', async d => {
+  if(!pc || d.from !== partnerId) return;
+  if(pc.remoteDescription) { try { await pc.addIceCandidate(d.candidate); } catch(e){} }
+  else pendingIce.push(d.candidate);
+});
+
+function next(){
+  if(!localStream) return;
+  closePeer();
   socket.emit('next');
 }
 
-function sendChat(){
-  let m=document.getElementById('msg').value;
-  if(!m) return;
-  socket.emit('chat',{text:m});
-  addChat("You: "+m);
-  document.getElementById('msg').value='';
+function report(){
+  if(!partnerId) return;
+  socket.emit('report');
+  addChat('Reported. Finding a new stranger...');
+  next();
 }
-socket.on('chat', d=> addChat("Stranger: "+d.text));
-function addChat(t){ let c=document.getElementById('chat'); c.innerHTML+=`<div>${t}</div>`; c.scrollTop=c.scrollHeight; }
 
-socket.on('partner-left', ()=>{ addChat("Stranger disconnected. Finding new..."); document.getElementById('remote').srcObject=null; });
-socket.on('waiting', ()=> addChat("Waiting for stranger..."));
+function sendChat(){
+  const el = document.getElementById('msg');
+  const m = el.value.trim();
+  if(!m || !partnerId) return;
+  socket.emit('chat', { text: m });
+  addChat('You: ' + m);
+  el.value = '';
+}
+document.getElementById('msg').addEventListener('keydown', e => { if(e.key === 'Enter') sendChat(); });
+
+socket.on('chat', d => addChat('Stranger: ' + d.text));
+socket.on('partner-left', () => { addChat('Stranger disconnected. Finding new...'); closePeer(); });
+socket.on('waiting', () => addChat('Waiting for stranger...'));
+socket.on('searching', () => addChat('Finding new stranger...'));
+socket.on('online', n => { document.getElementById('online').textContent = n + ' online'; });
 </script>
 </body>
 </html>
