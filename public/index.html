@@ -52,7 +52,7 @@ function addChat(t){
 }
 
 function closePeer(){
-  if(pc){ pc.onicecandidate = null; pc.ontrack = null; pc.close(); pc = null; }
+  if(pc){ pc.onicecandidate = null; pc.ontrack = null; pc.oniceconnectionstatechange = null; pc.close(); pc = null; }
   pendingIce = [];
   partnerId = null;
   document.getElementById('remote').srcObject = null;
@@ -77,13 +77,24 @@ async function start(){
 }
 
 function createPeer(){
-  pc = new RTCPeerConnection(iceConfig);
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-  pc.onicecandidate = e => {
+  const peer = new RTCPeerConnection(iceConfig);
+  pc = peer;
+  localStream.getTracks().forEach(t => peer.addTrack(t, localStream));
+  peer.onicecandidate = e => {
     if(e.candidate && partnerId) socket.emit('ice-candidate', { to: partnerId, candidate: e.candidate });
   };
-  pc.ontrack = e => { document.getElementById('remote').srcObject = e.streams[0]; };
-  return pc;
+  peer.ontrack = e => {
+    const v = document.getElementById('remote');
+    v.srcObject = e.streams[0];
+    v.play().catch(()=>{});
+  };
+  peer.oniceconnectionstatechange = () => {
+    const s = peer.iceConnectionState;
+    if(s === 'checking') addChat('Connecting video...');
+    else if(s === 'connected' || s === 'completed') addChat('Video connected.');
+    else if(s === 'failed') addChat('Video failed: the two networks block a direct connection (a TURN server is needed on the server).');
+  };
+  return peer;
 }
 
 async function flushIce(){
